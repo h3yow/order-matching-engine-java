@@ -1,0 +1,21 @@
+package com.github.h3yow.ordermatchingenginejava.domain;
+
+/**
+ * 可区分的拒绝原因（幂等场景返回 OK 而非拒绝）。
+ */
+public enum RejectReason {
+    NONE,
+    UNKNOWN_ACCOUNT,
+    UNKNOWN_SYMBOL,
+    INVALID_QUANTITY,
+    INVALID_PRICE,
+    PRICE_OUT_OF_BAND,
+    QUANTITY_EXCEEDS_LIMIT,
+    INSUFFICIENT_AVAILABLE,
+    POSITION_LIMIT_EXCEEDED,
+    MARKET_NO_LIQUIDITY,
+    ORDER_NOT_FOUND,
+    ORDER_ALREADY_FILLED,
+    ORDER_ALREADY_CANCELED,
+    DUPLICATE_CLIENT_ORDER_ID
+}
