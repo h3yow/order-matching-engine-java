@@ -14,11 +14,13 @@ import com.github.h3yow.ordermatchingenginejava.engine.Match;
 import com.github.h3yow.ordermatchingenginejava.engine.MatchingEngine;
 import com.github.h3yow.ordermatchingenginejava.engine.OrderBook;
 import com.github.h3yow.ordermatchingenginejava.risk.RiskValidator;
+import com.github.h3yow.ordermatchingenginejava.store.Amend;
 import com.github.h3yow.ordermatchingenginejava.store.Event;
 import com.github.h3yow.ordermatchingenginejava.store.EventStore;
 import jakarta.annotation.PostConstruct;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -60,6 +62,8 @@ public class TradingService {
     private final Map<String, Order> clientIndex = new HashMap<>();
     /** 已结算成交：fillId + '|' + ownerAccountId，跨重放与外部投递共用。 */
     private final Set<String> settledFillKeys = new HashSet<>();
+    /** 已生效改单：orderId + '|' + clientAmendId，重放时由 ORDER_AMENDED 流水重建。 */
+    private final Set<String> amendedKeys = new HashSet<>();
 
     private long orderIdSeq = 0;
     private long seqCounter = 0;
@@ -116,18 +120,37 @@ public class TradingService {
                 case ORDER_ACCEPTED -> replayOrder(event.order());
                 case FILL -> replayFill(event.fill());
                 case ORDER_CANCELED -> replayCancel(event.order());
+                case ORDER_AMENDED -> replayAmend(event.amend());
             }
         }
-        // 所有 FILL/CANCEL 应用完毕后，仍处于 NEW 且有剩余的限价单才是重启前簿内可见挂单。
+        // 所有 FILL/CANCEL/AMEND 应用完毕后，仍处于 NEW 且有剩余的限价单才是重启前簿内可见挂单。
+        // 按接收序号 seq 升序入簿：实时路径下同价档位 FIFO 顺序即 seq 顺序（改单换新 seq 排队尾），
+        // 由此恢复出的各档位排队顺序与重启前逐字段一致。
         // 账户最终状态 = 种子 + FILL；在此之上补建这些活单仍占用的冻结，得到重启前的可用现金/持仓。
-        for (Order o : ordersById.values()) {
-            if (o.getStatus() == OrderStatus.NEW
-                    && o.getType() == OrderType.LIMIT && o.remainingQty() > 0) {
-                book(o.getSymbol()).add(o);
-                replayReserveLiveOrder(o);
-            }
+        List<Order> liveOrders = ordersById.values().stream()
+                .filter(o -> o.getStatus() == OrderStatus.NEW
+                        && o.getType() == OrderType.LIMIT && o.remainingQty() > 0)
+                .sorted(Comparator.comparingLong(Order::getSeq))
+                .toList();
+        for (Order o : liveOrders) {
+            book(o.getSymbol()).add(o);
+            replayReserveLiveOrder(o);
         }
         assertInvariants("after replay");
+    }
+
+    /** 重放改单：推进价格/数量/接收序号；filledQty 与状态始终由 FILL/CANCEL 流水推进。 */
+    private void replayAmend(Amend a) {
+        Order o = ordersById.get(a.orderId());
+        if (o == null) {
+            log.warn("amend event references unknown order, skipped: orderId={}", a.orderId());
+            return;
+        }
+        o.setLimitPrice(a.limitPrice());
+        o.setQuantity(a.quantity());
+        o.setSeq(a.seq());
+        seqCounter = Math.max(seqCounter, a.seq());
+        amendedKeys.add(amendKey(a.orderId(), a.clientAmendId()));
     }
 
     /** 重放补冻结：买单按剩余数量*限价占用可用现金；卖单占用可卖持仓。 */
@@ -323,6 +346,135 @@ public class TradingService {
                     orderId, order.getClientOrderId(), canceledQty,
                     order.getFilledQty(), snapshot(order.getAccountId()));
             return new CancelResult(order, true, RejectReason.NONE, canceledQty);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 改单
+    // ------------------------------------------------------------------
+
+    /**
+     * 改单（原子 cancel-replace 语义）：仅允许仍挂盘（NEW 且有剩余）的限价单改价/改量。
+     *
+     * <p>规则：
+     * <ul>
+     *   <li>newQuantity 为改后订单总数量（含已成交部分），必须 &gt; filledQty；
+     *       已成交部分不可逆，想清掉剩余请走撤单；</li>
+     *   <li>改单成功后订单失去原时间优先：分配新接收序号，按改后价格重新排到队尾；</li>
+     *   <li>改后价格与盘口交叉时立即按现有撮合规则成交（maker 价）；</li>
+     *   <li>风控与下单同一套：先临时解冻旧占用（账户层可精确逆运算），按改后剩余量校验，
+     *       拒绝则恢复旧冻结——订单簿不动、无流水，账户与订单跟没发生过一样；</li>
+     *   <li>幂等键：orderId + clientAmendId，重复提交（含网络重试）只生效一次。</li>
+     * </ul>
+     */
+    public AmendResult amendOrder(long orderId, String clientAmendId, long newPrice, long newQuantity) {
+        synchronized (lock) {
+            if (clientAmendId == null || clientAmendId.isBlank()) {
+                throw new IllegalArgumentException("clientAmendId is required");
+            }
+            Order order = ordersById.get(orderId);
+            if (order == null) {
+                throw new TradingException(RejectReason.ORDER_NOT_FOUND, "order not found: " + orderId);
+            }
+
+            // 幂等：同一订单同一 clientAmendId 重复提交，返回当前状态，不重复改单/重复调整冻结。
+            String amendKey = amendKey(orderId, clientAmendId);
+            if (amendedKeys.contains(amendKey)) {
+                log.info("idempotent amend hit: orderId={}, clientAmendId={}, status={}, filledQty={}, snapshot={}",
+                        orderId, clientAmendId, order.getStatus(), order.getFilledQty(),
+                        snapshot(order.getAccountId()));
+                return new AmendResult(order, true, RejectReason.NONE, List.of());
+            }
+
+            if (order.getType() == OrderType.MARKET) {
+                throw new TradingException(RejectReason.ORDER_NOT_AMENDABLE,
+                        "market order is not amendable: " + orderId);
+            }
+            switch (order.getStatus()) {
+                case FILLED -> throw new TradingException(RejectReason.ORDER_ALREADY_FILLED,
+                        "order already fully filled: " + orderId);
+                case CANCELED -> throw new TradingException(RejectReason.ORDER_ALREADY_CANCELED,
+                        "order already canceled: " + orderId);
+                default -> { }
+            }
+            long filled = order.getFilledQty();
+            if (newQuantity <= filled) {
+                throw new TradingException(RejectReason.INVALID_QUANTITY,
+                        "new quantity " + newQuantity + " must exceed filledQty " + filled
+                                + " (use cancel to close the remaining)");
+            }
+
+            Account account = accounts.get(order.getAccountId());
+            long refPrice = referencePrice(order.getSymbol());
+            long oldRemaining = order.remainingQty();
+
+            // 风控（与下单同一套）：先临时解冻旧占用，按改后剩余量构造探针单校验；
+            // 拒绝则恢复旧冻结——账户精确复原、订单簿不动、不写流水。
+            releaseReservation(order, oldRemaining);
+            Order probe = amendProbe(order, newPrice, newQuantity - filled);
+            try {
+                riskValidator.validate(account, probe, refPrice);
+            } catch (TradingException ex) {
+                reserveQty(order, oldRemaining);
+                log.info("amend rejected by risk: orderId={}, clientAmendId={}, reason={}, newPrice={}, newQty={}, snapshot={}",
+                        orderId, clientAmendId, ex.getReason(), newPrice, newQuantity,
+                        snapshot(order.getAccountId()));
+                throw ex;
+            }
+
+            // 通过风控：出簿（旧价档位）→ 改价改量换新序号 → 落流水 → 重新冻结 → 即时撮合。
+            book(order.getSymbol()).remove(order);
+            order.setLimitPrice(newPrice);
+            order.setQuantity(newQuantity);
+            order.setSeq(++seqCounter);
+            Amend amend = new Amend(orderId, clientAmendId, newPrice, newQuantity,
+                    order.getSeq(), System.currentTimeMillis());
+            eventStore.append(Event.orderAmended(amend));
+            amendedKeys.add(amendKey);
+            reserveQty(order, order.remainingQty());
+
+            // 改后价格与盘口交叉时立即成交（taker 角色，成交价取 maker 价）。
+            LongPredicate guard = p -> refPrice <= 0 || withinDeviation(p, refPrice);
+            List<Match> matches = matchingEngine.match(order, book(order.getSymbol()), guard);
+            List<Long> fillIds = new ArrayList<>();
+            for (Match m : matches) {
+                fillIds.add(settleMatch(m));
+            }
+
+            assertInvariants("amend order " + orderId);
+            log.info("amend handled: orderId={}, clientAmendId={}, newPrice={}, newQty={}, filled={}, remaining={}, status={}, fillIds={}, snapshot={}",
+                    orderId, clientAmendId, newPrice, newQuantity, order.getFilledQty(),
+                    order.remainingQty(), order.getStatus(), fillIds, snapshot(order.getAccountId()));
+            return new AmendResult(order, false, RejectReason.NONE, fillIds);
+        }
+    }
+
+    /** 风控探针单：以改后剩余数量为数量的限价单，复用下单风控规则。 */
+    private Order amendProbe(Order base, long newPrice, long newRemaining) {
+        Order probe = new Order();
+        probe.setAccountId(base.getAccountId());
+        probe.setSymbol(base.getSymbol());
+        probe.setSide(base.getSide());
+        probe.setType(OrderType.LIMIT);
+        probe.setLimitPrice(newPrice);
+        probe.setQuantity(newRemaining);
+        probe.setFilledQty(0L);
+        probe.setStatus(OrderStatus.NEW);
+        return probe;
+    }
+
+    /** 改单冻结（仅限价单）：买单按改后限价冻结资金；卖单冻结可卖持仓。 */
+    private void reserveQty(Order order, long qty) {
+        if (qty <= 0) {
+            return;
+        }
+        Account acc = accounts.get(order.getAccountId());
+        if (order.getSide() == Side.BUY) {
+            acc.setAvailableCash(acc.getAvailableCash()
+                    - qty * order.getLimitPrice() / RiskValidator.SCALE);
+        } else {
+            Position pos = acc.positionOf(order.getSymbol());
+            pos.setAvailable(pos.getAvailable() - qty);
         }
     }
 
@@ -572,6 +724,10 @@ public class TradingService {
 
     private String fillKey(long fillId, String ownerAccountId) {
         return fillId + "|" + ownerAccountId;
+    }
+
+    private String amendKey(long orderId, String clientAmendId) {
+        return orderId + "|" + clientAmendId;
     }
 
     private Side parseSide(String text) {

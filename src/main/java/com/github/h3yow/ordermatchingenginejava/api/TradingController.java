@@ -5,6 +5,7 @@ import com.github.h3yow.ordermatchingenginejava.domain.OrderStatus;
 import com.github.h3yow.ordermatchingenginejava.domain.Side;
 import com.github.h3yow.ordermatchingenginejava.engine.OrderBook;
 import com.github.h3yow.ordermatchingenginejava.service.AccountSnapshot;
+import com.github.h3yow.ordermatchingenginejava.service.AmendResult;
 import com.github.h3yow.ordermatchingenginejava.service.CancelResult;
 import com.github.h3yow.ordermatchingenginejava.service.OrderResult;
 import com.github.h3yow.ordermatchingenginejava.service.TradingService;
@@ -92,6 +93,42 @@ public class TradingController {
     @PostMapping("/orders/{orderId}/cancel")
     public CancelResult cancel(@PathVariable long orderId) {
         return tradingService.cancel(orderId);
+    }
+
+    /** 改单请求：clientAmendId 为幂等键；quantity 为改后订单总数量（含已成交部分）。 */
+    public record AmendOrderRequest(String clientAmendId, long price, long quantity) {
+    }
+
+    public record AmendOrderResponse(
+            boolean accepted,
+            boolean idempotent,
+            long orderId,
+            String status,
+            String rejectReason,
+            long price,
+            long quantity,
+            long filledQuantity,
+            long remainingQuantity,
+            List<Long> fillIds
+    ) {
+    }
+
+    @PostMapping("/orders/{orderId}/amend")
+    public AmendOrderResponse amend(@PathVariable long orderId, @RequestBody AmendOrderRequest req) {
+        AmendResult result = tradingService.amendOrder(
+                orderId, req.clientAmendId(), req.price(), req.quantity());
+        Order o = result.order();
+        return new AmendOrderResponse(
+                o != null && o.getStatus() != OrderStatus.REJECTED,
+                result.idempotent(),
+                o == null ? 0 : o.getOrderId(),
+                o == null ? null : o.getStatus().name(),
+                result.rejectReason() == null ? null : result.rejectReason().name(),
+                o == null ? 0 : o.getLimitPrice(),
+                o == null ? 0 : o.getQuantity(),
+                o == null ? 0 : o.getFilledQty(),
+                o == null ? 0 : o.remainingQty(),
+                result.fillIds());
     }
 
     @PostMapping("/fills/deliver")
