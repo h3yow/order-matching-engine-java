@@ -4,5 +4,6 @@ package com.github.h3yow.ordermatchingenginejava.store;
 public enum EventType {
     ORDER_ACCEPTED,
     FILL,
-    ORDER_CANCELED
+    ORDER_CANCELED,
+    ORDER_AMENDED
 }

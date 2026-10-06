@@ -19,4 +19,8 @@ public record Event(EventType type, Order order, Fill fill, long timestamp) {
     public static Event orderCanceled(Order order) {
         return new Event(EventType.ORDER_CANCELED, order, null, System.currentTimeMillis());
     }
+
+    public static Event orderAmended(Order order) {
+        return new Event(EventType.ORDER_AMENDED, order, null, System.currentTimeMillis());
+    }
 }

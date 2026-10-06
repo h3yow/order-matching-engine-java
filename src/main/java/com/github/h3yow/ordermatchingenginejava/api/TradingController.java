@@ -94,6 +94,34 @@ public class TradingController {
         return tradingService.cancel(orderId);
     }
 
+    /**
+     * 改单请求：price/quantity 传 null 表示该项不变；quantity 为新的订单总数量（含已成交）。
+     * clientAmendId 为幂等键：同一 orderId+clientAmendId 重复提交只生效一次。
+     */
+    public record AmendOrderRequest(
+            String clientAmendId,
+            Long price,
+            Long quantity
+    ) {
+    }
+
+    @PostMapping("/orders/{orderId}/amend")
+    public SubmitOrderResponse amend(@PathVariable long orderId,
+                                     @RequestBody AmendOrderRequest req) {
+        OrderResult result = tradingService.amendOrder(
+                orderId, req.clientAmendId(), req.price(), req.quantity());
+        Order o = result.order();
+        return new SubmitOrderResponse(
+                o != null && o.getStatus() != OrderStatus.REJECTED,
+                result.idempotent(),
+                o == null ? 0 : o.getOrderId(),
+                o == null ? null : o.getStatus().name(),
+                result.rejectReason() == null ? null : result.rejectReason().name(),
+                o == null ? 0 : o.getFilledQty(),
+                o == null ? 0 : o.remainingQty(),
+                result.fillIds());
+    }
+
     @PostMapping("/fills/deliver")
     public DeliverFillResponse deliver(@RequestBody DeliverFillRequest req) {
         boolean applied = tradingService.deliverFill(

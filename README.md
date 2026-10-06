@@ -25,7 +25,8 @@ src/test/java/.../tests/
 ├── MarketOrderTest.java         # 市价部分成交撤销、无流动性拒绝
 ├── TradingServiceTest.java      # 幂等下单、撤单拒绝原因、风控、守恒
 ├── ConcurrencyTest.java         # 16/20 线程并发买入、并发重复 clientOrderId、撤单竞争
-└── ReplayConsistencyTest.java   # 重启重放一致、重复成交投递幂等、资金/持仓守恒
+├── ReplayConsistencyTest.java   # 重启重放一致、重复成交投递幂等、资金/持仓守恒
+└── AmendOrderTest.java          # 改单：成功路径、可区分拒绝、幂等、即时成交、并发、重放
 ```
 
 ---
@@ -48,10 +49,60 @@ src/test/java/.../tests/
 ### 2.3 生命周期
 ```
 NEW（簿内，含部分成交） ──全部成交──▶ FILLED
+        │ │
+        │  └──改单──▶ NEW（新价/新量、新 seq 排队尾；若与盘口交叉则先即时成交）
         │
          └──撤单──▶ CANCELED（可发生在部分成交之后，仅撤剩余数量）
 下单请求未通过风控 ──▶ REJECTED（不分配 orderId、不写流水、账户零变化）
 ```
+
+---
+
+### 2.4 改单（Amend）
+
+对在簿限价单的**改价、改量或同时改**，无需先撤再下，但**失去原时间优先**。
+
+**能改什么**
+- 仅 `NEW` 且仍有剩余数量的**限价单**；`price`/`quantity` 传 `null` 表示该项不变。
+- `quantity` 是**新的订单总数量（含已成交部分）**，必须大于 `filledQty`；
+  已成交部分不受影响，改的是剩余未成交部分（新剩余 = 新总量 − 已成交）。
+  想撤掉全部剩余请用撤单接口。
+
+**不能改什么（拒绝原因可区分，HTTP 422）**
+
+| 场景 | rejectReason |
+| --- | --- |
+| 订单不存在 | `ORDER_NOT_FOUND` |
+| 订单已全部成交 | `ORDER_ALREADY_FILLED` |
+| 订单已撤销 | `ORDER_ALREADY_CANCELED` |
+| 非在簿限价单（如市价单，防御分支） | `ORDER_NOT_AMENDABLE` |
+| 新总量 ≤ 已成交量 | `INVALID_QUANTITY` |
+| 新价 ≤ 0 / 偏离参考价超 band | `INVALID_PRICE` / `PRICE_OUT_OF_BAND` |
+| 新总量 > `max-order-quantity` | `QUANTITY_EXCEEDS_LIMIT` |
+| 改后冻结超可用现金/可卖持仓 | `INSUFFICIENT_AVAILABLE` |
+| 改后净持仓超限 | `POSITION_LIMIT_EXCEEDED` |
+
+**排队与即时成交**
+- 改单生效即分配**新 `seq`**：从原价格档位出队，按新价格排到**同价位队尾**，
+  不能靠反复改单赖在队首。
+- 改单后订单作为 **taker 立即撮合**：改后价格与盘口交叉的部分按 maker 价立即成交
+  （复用既有撮合与结算），剩余以新价重新挂簿；全部成交则状态变 `FILLED`。
+
+**与下单同一套风控、同一套冻结**
+- 流程：释放旧剩余冻结 → 用“新剩余 + 新价”的影子单走 `RiskValidator.validate`
+  （与下单完全相同的校验项）→ 通过才落 `ORDER_AMENDED` 流水并按新剩余重新冻结。
+- **拒绝零副作用**：风控拒绝时精确回补旧冻结，订单、账户、订单簿与改单前完全一致。
+- 买单冻结单价记录在订单的 `frozenPrice` 上，成交释放按
+  `freeze(成交前剩余) − freeze(成交后剩余)` 望远镜式重算，任意时刻残留冻结恰好
+  等于 `freeze(remainingQty)`，与重放口径逐字段一致（定点截断也不会漂移）。
+
+**幂等（clientAmendId）**
+- 幂等键：`orderId + "|" + clientAmendId`（请求必带 `clientAmendId`）。
+- 同一改单请求重复提交（含网络重试、重启后重投）：返回首次结果，`idempotent=true`，
+  `fillIds=[]`，不重复改单、不重复调整冻结、不重复刷新排队序号。
+- 改单、撤单、成交、下单全部在同一把串行锁内执行：并发改单/撤单/成交的最终状态
+  必然自洽（要么先改后撤、要么先撤后改被拒 `ORDER_ALREADY_CANCELED`），
+  不会出现重复冻结或“又改又撤”的矛盾状态。
 
 ---
 
@@ -67,12 +118,14 @@ NEW（簿内，含部分成交） ──全部成交──▶ FILLED
 **冻结与结算（实时路径）**
 - 下买单：按**最坏价**冻结资金
   - 限价单最坏价 = 限价；市价单最坏价 = 参考价 × (1 + 滑点)。
-  - `availableCash -= qty * worstPrice / 10000`。
-  - 成交时 `cash -= 实际成交额`，冻结与实际额之差**回补** `availableCash`；
-    撤单/市价剩余则把未成交部分的冻结**全额回补**。
+  - `availableCash -= qty * worstPrice / 10000`，最坏价记入订单 `frozenPrice`。
+  - 成交时 `cash -= 实际成交额`，释放冻结 `freeze(成交前剩余) − freeze(成交后剩余)`
+    与实际额之差**回补** `availableCash`；撤单/市价剩余则把未成交部分的冻结**全额回补**。
 - 下卖单：`position.available -= qty` 冻结持仓。
   - 成交时 `position.quantity -= qty`（`available` 已在下单时扣减，成交不再变）；
     撤单则把未成交部分 `available += qty` 回补。
+- 改单：先按旧 `frozenPrice` 回补旧剩余冻结，风控通过后再按新价/新剩余重新冻结
+  （详见 2.4）。
 
 **引擎在每次写操作后断言不变量**（违反即抛出 `IllegalStateException`）：
 - `availableCash >= minAvailableCash`（默认 0，**永不出现负余额**）；
@@ -128,13 +181,19 @@ NEW（簿内，含部分成交） ──全部成交──▶ FILLED
 - 内部撮合、外部成交投递（`POST /api/trading/fills/deliver`）、重启重放共用同一张
   已结算表；**同一成交事件重复投递/重复重放绝不重复结算**。
 
+### 5.4 改单幂等（clientAmendId）
+- 幂等键：`orderId + "|" + clientAmendId`，规则与下单幂等一致（见 2.4）：
+  重复提交返回首次结果，不重复改单/冻结/刷新排队序号；
+  幂等表随 `ORDER_AMENDED` 流水重放恢复，重启后重投仍命中。
+
 ---
 
 ## 6. 持久化与重放（Event Sourcing）
 
 ### 6.1 事件流水
 - 存储：`trading.event-log-dir/events.jsonl`，每行一个 JSON（JSON Lines），同步追加 flush。
-- 三类事件：`ORDER_ACCEPTED`（完整订单快照）、`FILL`（账户侧成交流水）、`ORDER_CANCELED`。
+- 四类事件：`ORDER_ACCEPTED`（完整订单快照）、`FILL`（账户侧成交流水）、
+  `ORDER_CANCELED`、`ORDER_AMENDED`（改后完整快照：新价/新总量/已成交/新 seq/clientAmendId）。
 - **先写流水，再改内存状态**，因此不会出现“已扣款但无流水”。
 
 ### 6.2 重放
@@ -143,13 +202,17 @@ NEW（簿内，含部分成交） ──全部成交──▶ FILLED
 2. `FILL`：按 fillId+owner 去重，推进订单 `filledQty` 并把账户从种子状态累计
    （直接口径：买扣款增仓、卖收款减仓）；
 3. `ORDER_CANCELED`：推进订单状态为 CANCELED；
-4. 全部事件应用完后：
-   - 仍为 `NEW` 且有剩余的限价单重新挂入订单簿；
-   - 为这些活单**补建冻结**（买冻结剩余资金、卖冻结剩余持仓），
-     得到与重启前完全一致的 `availableCash` / 可卖持仓。
+4. `ORDER_AMENDED`：把改后快照（价格/总量/已成交/新 seq）覆盖到订单，
+   并重建改单幂等表（`orderId+clientAmendId`）；
+5. 全部事件应用完后：
+   - 仍为 `NEW` 且有剩余的限价单**按 seq 升序**重新挂入订单簿
+     （改单刷新过 seq，同价位排队顺序因此与重启前逐字段一致）；
+   - 为这些活单**补建冻结**（买按改后限价冻结剩余资金、卖冻结剩余持仓，
+     并恢复订单 `frozenPrice`），得到与重启前完全一致的 `availableCash` / 可卖持仓。
 
-重放结束后可见状态（账户快照、订单状态/成交数量、订单簿挂单、幂等索引）与重启前一致，
-由 `ReplayConsistencyTest.replayRestoresIdenticalVisibleState` 端到端验证。
+重放结束后可见状态（账户快照、订单价格/数量/成交量/状态/seq、订单簿各档位排队顺序、
+下单与改单幂等索引）与重启前一致，由 `ReplayConsistencyTest` 与
+`AmendOrderTest.amendReplayConsistency` 端到端验证。
 
 ---
 
@@ -177,6 +240,7 @@ trading.seed-positions.alice__BTC=1000000   # key 格式：accountId__symbol
 | 方法与路径 | 说明 |
 | --- | --- |
 | `POST /api/trading/orders` | 下单（body：clientOrderId/accountId/symbol/side/type/price/quantity） |
+| `POST /api/trading/orders/{orderId}/amend` | 改单（body：clientAmendId/price/quantity，null 表示该项不变） |
 | `POST /api/trading/orders/{orderId}/cancel` | 撤剩余数量 |
 | `POST /api/trading/fills/deliver` | 外部成交事件投递（fillId+owner 幂等） |
 | `GET  /api/trading/orders/{orderId}` | 订单详情 |
@@ -194,6 +258,13 @@ curl -X POST http://localhost:8080/api/trading/orders \
        "side":"BUY","type":"LIMIT","price":10000,"quantity":100}'
 ```
 
+改单示例（把 1 号单改价为 9900、改总量为 200；quantity 含已成交部分）：
+```bash
+curl -X POST http://localhost:8080/api/trading/orders/1/amend \
+  -H 'Content-Type: application/json' \
+  -d '{"clientAmendId":"a-1","price":9900,"quantity":200}'
+```
+
 ---
 
 ## 9. 验证方法
@@ -202,7 +273,7 @@ curl -X POST http://localhost:8080/api/trading/orders \
 ```bash
 mvn test
 ```
-共 20 个用例（5 个测试类），覆盖：
+共 28 个用例（6 个测试类），覆盖：
 
 | 测试类 | 覆盖点 |
 | --- | --- |
@@ -211,6 +282,7 @@ mvn test
 | `TradingServiceTest` | clientOrderId 幂等、撤单三类拒绝原因、部分成交后撤单冻结回补、超数量/价格偏离/资金不足拒绝且账户不变、卖空拒绝 |
 | `ConcurrencyTest` | 16 线程并发吃单不超卖且无负余额；20 线程相同 clientOrderId 仅成交一次；并发撤单竞争返回 ALREADY_FILLED |
 | `ReplayConsistencyTest` | 重启重放后账户/订单簿/幂等索引完全一致；重复投递 fillId 只结算一次（重启后仍去重）；现金总量与持仓双边守恒 |
+| `AmendOrderTest` | 改价/改量冻结重算且失去队首、部分成交后改量、八类可区分拒绝且零副作用、同 clientAmendId 幂等、改价交叉即时成交、并发改单/撤单/成交竞争自洽、改单混合流水重启重放逐字段一致（含排队顺序与改单幂等表） |
 
 测试日志（控制台 INFO）按要求打印**订单标识**（orderId/clientOrderId/fillId）、
 **判定依据**（命中的规则/拒绝原因）与**账户快照**（现金、可用现金、各标的持仓总量与可卖量），例如：
@@ -247,3 +319,12 @@ cat data/trading-log/events.jsonl
   顺序号与事件存储换成外部组件（如数据库/分区日志），语义保持一致。
 - 不实现手续费、自成交预防（crash-only 场景下订单状态以前序事件为准）、撮合后的
   行情发布；最近成交价已作为参考价供风控使用。
+
+### 10.1 改单能力的兼容性边界
+- **对既有行为无回退**：下单/撤单/风控/幂等/成交投递/重放的对外语义不变，
+  既有 20 个用例全部继续通过。
+- 事件流水**向后兼容**：旧流水（无 `ORDER_AMENDED`、订单无 `amendId`/`frozenPrice`
+  字段）可正常重放——缺失字段按 null/0 处理，活单冻结单价在重放补冻结时恢复为限价。
+- 新流水包含 `ORDER_AMENDED` 事件，**不可**用旧版本代码重放（旧版本不认识该事件类型）。
+- 改单不引入新的订单状态：订单仍是 NEW/FILLED/CANCELED/REJECTED 四态，
+  改单只是在 NEW 内的价格/数量/序号迁移（可能触发成交进入 FILLED）。

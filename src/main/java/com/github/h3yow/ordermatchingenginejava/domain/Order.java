@@ -24,6 +24,14 @@ public final class Order {
     private long createdAt;
     /** 单调递增的接收序号，决定同一价格下的时间优先。 */
     private long seq;
+    /** 最近一次生效改单的客户端幂等键（未改过为 null），随 ORDER_AMENDED 事件落盘。 */
+    private String amendId;
+    /**
+     * 当前这笔冻结使用的单价（BUY：冻结资金的最坏单价；SELL 不使用）。
+     * 限价单等于限价；市价单为下单时参考价上浮保护带。冻结/释放一律按
+     * remainingQty*frozenPrice 重算，保证与重放口径逐字段一致。
+     */
+    private long frozenPrice;
 
     public Order() {
     }
@@ -130,6 +138,22 @@ public final class Order {
 
     public void setSeq(long seq) {
         this.seq = seq;
+    }
+
+    public String getAmendId() {
+        return amendId;
+    }
+
+    public void setAmendId(String amendId) {
+        this.amendId = amendId;
+    }
+
+    public long getFrozenPrice() {
+        return frozenPrice;
+    }
+
+    public void setFrozenPrice(long frozenPrice) {
+        this.frozenPrice = frozenPrice;
     }
 
     /** 剩余未成交数量。 */
